@@ -1,0 +1,95 @@
+name: Build Kernel Module
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+
+    steps:
+    - name: Checkout Module Source
+      uses: actions/checkout@v4
+
+    - name: Install necessary packages
+      run: |
+        apt-get update
+        export DEBIAN_FRONTEND=noninteractive
+        ln -fs /usr/share/zoneinfo/America/New_York /etc/localtime
+        apt-get install -y tzdata lsb-release
+        dpkg-reconfigure --frontend noninteractive tzdata
+        apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib libxml2-utils bzip2 libbz2-dev libbz2-1.0 libghc-bzlib-dev squashfs-tools pngcrush schedtool dpkg-dev liblz4-tool make optipng maven libssl-dev pwgen libswitch-perl policycoreutils minicom libxml-sax-base-perl libxml-simple-perl bc libc6-dev-i386 lib32ncurses5-dev libx11-dev lib32z-dev libgl1-mesa-dev xsltproc unzip device-tree-compiler python3 python2
+
+    - name: Cache Dependencies
+      uses: actions/cache@v4
+      id: cache
+      with:
+        path: |
+          kernel_source
+          clang
+          ~/.ccache
+        key: ${{ runner.os }}-kernel-chopin-${{ hashFiles('**/Makefile', 'kernel/**') }}
+        restore-keys: |
+          ${{ runner.os }}-kernel-chopin-
+
+    - name: Ensure Kernel Source
+      run: |
+        if [ -d kernel_source/.git ]; then
+          echo "kernel_source already prepared"
+        else
+          rm -rf kernel_source
+          git clone --depth=1 https://github.com/SMlc666/android_kernel_chopin_android_T -b T kernel_source
+        fi
+
+    - name: Ensure Toolchain
+      run: |
+        if [ -d clang/.git ]; then
+          echo "clang already prepared"
+        else
+          rm -rf clang
+          git clone --depth=1 https://gitlab.com/LeCmnGend/proton-clang.git -b clang-13 clang
+        fi
+
+    - name: Set up Environment
+      run: |
+        echo "$(pwd)/clang/bin" >> $GITHUB_PATH
+        echo "CCACHE_DIR=$(pwd)/.ccache" >> $GITHUB_ENV
+        echo "USE_CCACHE=1" >> $GITHUB_ENV
+        ccache -M 5G
+
+    - name: Prepare Kernel Source for Module Build
+      working-directory: ./kernel_source
+      run: |
+        # Reset module directory and sync latest code
+        rm -rf drivers/hack
+        mkdir -p drivers/hack
+        cp -a ../kernel/. drivers/hack/
+
+        # Add module to Kconfig and Makefile (idempotent)
+        grep -q 'source "drivers/hack/Kconfig"' drivers/Kconfig || echo 'source "drivers/hack/Kconfig"' >> drivers/Kconfig
+        grep -q 'obj-$(CONFIG_KERNEL_HACK) += hack/' drivers/Makefile || echo 'obj-$(CONFIG_KERNEL_HACK) += hack/' >> drivers/Makefile
+
+        # Configure the kernel
+        make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- chopin_user_defconfig
+
+        # Enable the module config
+        scripts/config --file out/.config --enable CONFIG_KERNEL_HACK
+
+    - name: Build Kernel Module
+      working-directory: ./kernel_source
+      run: |
+        make -j$(nproc --all) O=out ARCH=arm64 CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld modules_prepare
+        
+        make -j$(nproc --all) O=out ARCH=arm64 CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld M=drivers/hack
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: KernelModule
+        path: kernel_source/out/drivers/hack/my_driver.ko
